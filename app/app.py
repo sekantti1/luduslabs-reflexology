@@ -310,7 +310,7 @@ def make_comp_table(data, playerName):
     compOutcome.loc[:, 'Rating change'] = ratingChange
     winCount = compOutcome.groupby('Comp')['Win'].sum()
     fightCount = compOutcome.groupby('Comp')['Win'].count()
-    winRate = np.round(winCount/fightCount * 100, 1)
+    winRate = np.round(winCount.astype(float)/fightCount.astype(float) * 100, 1)
     avgRatingChange = compOutcome.groupby('Comp')['Rating change'].mean()
     lossCount = fightCount-winCount
 
@@ -319,8 +319,8 @@ def make_comp_table(data, playerName):
 
 
     compTable = pd.DataFrame([comps, winCount, lossCount,
-                              winRate, np.round(avgRatingChange, 1),
-                              np.round(avgRatingChange*fightCount, 0)],
+                              winRate, np.round(avgRatingChange.astype(float), 1),
+                              np.round(avgRatingChange.astype(float)*fightCount.astype(float), 0)],
                              index=['Comp', 'Wins', 'Losses', 'Win rate (%)',
                                     'Avg rating change', 'Total rating change']).T
 
@@ -338,13 +338,46 @@ def get_player_match_count(*args):
 
     matchCountList = []
     for data in args:
+        if data.shape[0] == 0:
+            continue
         playerNameFields = [k for k in data.columns if '_Name' in k]
+        if not playerNameFields:
+            continue
         matchCount = pd.Series(data.loc[:,playerNameFields].values.ravel())\
                      .value_counts()
-        matchCountList.append(matchCount)
+        if len(matchCount) > 0:
+            matchCountList.append(matchCount)
 
-    combinedMatchCount = pd.DataFrame(matchCountList).fillna(0).sum(axis=0)
+    if not matchCountList:
+        return pd.Series(dtype=float)
+
+    combinedMatchCount = pd.concat(matchCountList).groupby(level=0).sum()
     return combinedMatchCount
+
+def get_player_name_candidates(data2v2, data3v3):
+    """Find the player name by picking whoever appears most frequently across all matches."""
+    results = []
+    for data in [data2v2, data3v3]:
+        if data.shape[0] == 0:
+            continue
+        name_cols = [c for c in data.columns if '_Name' in c]
+        results.extend(data[name_cols].values.ravel().tolist())
+    if not results:
+        return []
+    counts = pd.Series(results).value_counts()
+    return [counts.idxmax()]
+
+
+def merge_player_names(data, candidates):
+    """Replace all candidate names with the most common one so stats merge correctly."""
+    if len(candidates) <= 1:
+        return data, candidates[0] if candidates else None
+    primary = candidates[0]
+    nameCols = [c for c in data.columns if '_Name' in c]
+    for col in nameCols:
+        data[col] = data[col].replace({name: primary for name in candidates[1:]})
+    return data, primary
+
 
 
 @app.callback(
@@ -379,6 +412,8 @@ def update_partner_selection(player, bracket, season,
         raise PreventUpdate
     logging.info('Updating partner selection')
     allData = json.loads(json_data)
+    if bracket not in allData or not allData[bracket]:
+        raise PreventUpdate
     allBracketData = pd.DataFrame(allData[bracket])
     if season is None:
         bracketData = allBracketData
@@ -519,12 +554,18 @@ def load_data(content, n_clicks, href):
         dataShuffle['session'] = np.arange(0, dataShuffle.shape[0])
 
     matchCount = get_player_match_count(data2v2, data3v3)
-    if np.sum(matchCount == matchCount.max()) == 1:
-        playerName = matchCount.idxmax()
-    else:
-        # Should implement some verification step here if we can't
-        # determine the player
-        playerName = matchCount[matchCount==matchCount.max()].sample(1).index[0]
+    if len(matchCount) == 0:
+        return '{}', 'No data found', 'https://luduslabs.org/reflexology'
+
+    candidates = get_player_name_candidates(data2v2, data3v3)
+    logging.info('Player name candidates: %s' % candidates)
+
+    # Merge all candidate names (handles character renames) into the primary name
+    if data2v2.shape[0] > 0:
+        data2v2, playerName = merge_player_names(data2v2, candidates)
+    if data3v3.shape[0] > 0:
+        data3v3, playerName = merge_player_names(data3v3, candidates)
+    playerName = candidates[0]
 
     jsonData = '{"2v2":%s, "3v3":%s}'%(data2v2.to_json(),
                                        data3v3.to_json())
@@ -555,6 +596,8 @@ def update_hidden_comp_table(partner1, partner2, season, bracket,
     logging.info('Updating hidden comp table.')
     partners = [a for a in [partner1, partner2] if a is not None]
     allData = json.loads(json_data)
+    if bracket not in allData or not allData[bracket]:
+        raise PreventUpdate
     allBracketData = pd.DataFrame(allData[bracket])
     if season is None:
         bracketData = allBracketData
@@ -607,6 +650,8 @@ def update_plots(metric, partner1, partner2, season,
     logging.info('Updating plots.')
     partners = [a for a in [partner1, partner2] if a is not None]
     allData = json.loads(json_data)
+    if bracket not in allData or not allData[bracket]:
+        raise PreventUpdate
     allBracketData = pd.DataFrame(allData[bracket])
     if season is None:
         bracketData = allBracketData
@@ -931,6 +976,8 @@ def update_kpis(bracket, season, player, partner1, partner2, selected, json_data
     green = '#090'
     red = '#900'
     allData = json.loads(json_data)
+    if bracket not in allData or not allData[bracket]:
+        raise PreventUpdate
     partners = [p for p in [partner1, partner2] if p is not None]
     bracketData = pd.DataFrame(allData[bracket])
     allBracketData = pd.DataFrame(allData[bracket])
@@ -1029,7 +1076,10 @@ def update_season_selection(json_data):
     sortedSeasons = list(seasons)[::-1]
     seasonList = [{'label': get_season_label(k), 'value': k } for k in sortedSeasons
                   if k > 0]
-    return seasonList, max(seasons)
+    validSeasons = [s for s in seasons if s > 0]
+    if not validSeasons:
+        raise PreventUpdate
+    return seasonList, max(validSeasons)
     
     
 if __name__ == "__main__":

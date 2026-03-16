@@ -135,6 +135,15 @@ translation = {'Protección': 'Protection',
                "Танцующая с ветром": "Windwalker"
 }
 
+# Old format stepped every 3rd element; new format (17 elements) uses direct positions
+# New format positions: Name=0, Team=5, Race=6, Class=7, Damage=9, Healing=10,
+#                       Rating=11, RatingChange=12, Spec=15
+cols_new = {
+    'Name': 0, 'Team': 5, 'Race': 6, 'Class': 7,
+    'Damage': 9, 'Healing': 10, 'Rating': 11, 'Rating change': 12, 'Spec': 15
+}
+
+# Old format (stepped every 3): kept for backwards compatibility
 cols = ['Name', '', '', '', '', 'Team', 'Race', '', 'Class', 'Damage',
         'Healing', 'Rating', 'Rating change', '', '', 'Spec', '']
 
@@ -166,6 +175,10 @@ def fix_class(data):
     return data
 
 def parse_player(player):
+    # New addon format: 17 elements with direct positions
+    if len(player) >= 16 and isinstance(player[5], int) and player[5] in (0, 1):
+        return [(col, player[idx]) for col, idx in cols_new.items()]
+    # Old addon format: every 3rd element
     return [(cols[i], player[k]) for i, k in enumerate(range(0, len(player), 3))]
 
 @timeit
@@ -214,8 +227,18 @@ def parse_match_data(match):
                                        'Winner']}
 
     
-    mmrData = {'T0_MMR': match['TeamData'][0][9],
-               'T1_MMR': match['TeamData'][3][9]}
+    # TeamData format changed between addon versions:
+    # Old format: 4 entries, MMR at index [9]
+    # New format: 2 entries (one per team), MMR at index [3]
+    teamData = match.get('TeamData', [])
+    if len(teamData) >= 4 and len(teamData[0]) > 9:
+        # old format
+        mmrData = {'T0_MMR': teamData[0][9], 'T1_MMR': teamData[3][9]}
+    elif len(teamData) >= 2 and len(teamData[0]) > 3:
+        # new format
+        mmrData = {'T0_MMR': teamData[0][3], 'T1_MMR': teamData[1][3]}
+    else:
+        mmrData = {'T0_MMR': 0, 'T1_MMR': 0}
 
     data = dict(**matchData, **mmrData,
                 **parse_team(team1),
@@ -227,16 +250,56 @@ def parse_match_data(match):
 def capitalise_class(df):
     classCols = [k for k in df.columns if '_Class' in k]
     for c in classCols:
-        df.loc[:, c] = df[c].str.capitalize()
+        df.loc[:, c] = df[c].str.title()
 
     return df
 
 
-def parse_lua_file(file_name):
+def _load_lua_data(file_name):
+    """Load REFlexDatabase from a lua file or serialized string.
+    Handles both single-variable and multi-variable lua files."""
+    import re
+
+    def extract_var(text, varname):
+        m = re.search(r'\n?' + varname + r'\s*=\s*', text)
+        if not m:
+            return None
+        start = m.end()
+        depth = 0
+        i = start
+        while i < len(text):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    return varname + ' = ' + text[start:i+1]
+            i += 1
+        return None
+
     if len(file_name) < 100:
-        data = luadata.read(file_name, encoding='utf-8')
+        # It's a file path
+        with open(file_name, encoding='utf-8') as f:
+            text = f.read()
     else:
-        data = luadata.unserialize(file_name)
+        # It's the file contents passed as a string
+        text = file_name
+
+    # Try extracting just REFlexDatabase (handles multi-variable files)
+    chunk = extract_var(text, 'REFlexDatabase')
+    if chunk:
+        db = luadata.unserialize(chunk)
+        # luadata returns {'REFlexDatabase': [...]} when given a named variable
+        if isinstance(db, dict) and 'REFlexDatabase' in db:
+            return db
+        return {'REFlexDatabase': db}
+
+    # Fallback: try parsing the whole thing
+    return luadata.unserialize(text)
+
+
+def parse_lua_file(file_name):
+    data = _load_lua_data(file_name)
 
     raw2v2 = get_arena(data['REFlexDatabase'], '2v2')
     raw3v3 = get_arena(data['REFlexDatabase'], '3v3')
@@ -250,10 +313,7 @@ def parse_lua_file(file_name):
 
 
 def parse_lua_file_rbg(file_name):
-    if len(file_name) < 100:
-        data = luadata.read(file_name, encoding='utf-8')
-    else:
-        data = luadata.unserialize(file_name)
+    data = _load_lua_data(file_name)
 
     rawRbg = get_rbg(data['REFlexDatabase'])
 
